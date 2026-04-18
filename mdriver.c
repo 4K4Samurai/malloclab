@@ -132,7 +132,8 @@ struct thread_run_result {
     int heapsize;      // size to which memlib heap grew
 };
 static void * eval_mm_valid_single(void *);
-static int eval_mm_util(trace_t *trace, int tracenum, range_t **ranges);
+static int eval_mm_util(trace_t *trace, int tracenum, range_t **ranges,
+                        size_t *peak_heapsize_out);
 static void eval_mm_speed(void *ptr);
 static void eval_mm_speed_inner(void *ptr);
 static void * eval_mm_speed_single(void *_args);
@@ -355,10 +356,19 @@ int main(int argc, char **argv)
                 if (verbose > 1)
                     printf("efficiency, ");
 
-                int hwm = eval_mm_util(trace, i, &ranges);
+                size_t peak_heapsize = 0;
+                int hwm = eval_mm_util(trace, i, &ranges, &peak_heapsize);
                 if (size_multipliers[mi] == 1.0)    // record max high water mark
                     max_total_size = hwm;
-                mm_stats[i].util += ((double)hwm / (double)mem_heapsize());
+                /*
+                 * Use the peak heap size observed during the trace, not the
+                 * post-trace mem_heapsize().  A student mm_free that calls
+                 * mem_reset_brk() (legal but exploit-prone) used to make the
+                 * denominator artificially small and let util exceed 100%.
+                 */
+                mm_stats[i].util += (peak_heapsize == 0)
+                    ? 0.0
+                    : ((double)hwm / (double)peak_heapsize);
                 if (verbose > 1)
                     printf("and performance.\n");
                 mm_stats[i].secs += fsecs(eval_mm_speed, trace);
@@ -911,21 +921,32 @@ eval_mm_valid_single(void *_args)
  * eval_mm_util - Evaluate the space utilization of the student's package
  *   The idea is to remember the high water mark "hwm" of the heap for 
  *   an optimal allocator, i.e., no gaps and no internal fragmentation.
- *   Utilization is the ratio hwm/heapsize, where heapsize is the 
- *   size of the heap in bytes after running the student's malloc 
- *   package on the trace. Note that our implementation of mem_sbrk() 
- *   doesn't allow the students to decrement the brk pointer, so brk
- *   is always the high water mark of the heap. 
+ *   Utilization is the ratio hwm/peak_heapsize, where peak_heapsize is
+ *   the maximum value of mem_heapsize() observed at any point during
+ *   the trace. We deliberately do NOT use the post-trace mem_heapsize()
+ *   as the denominator: memlib exposes mem_reset_brk(), and a student
+ *   mm_free that resets the brk once all blocks are freed could make
+ *   the post-trace heap size arbitrarily small and inflate utilization
+ *   above 100%. Sampling the peak instead guarantees util <= 1.0,
+ *   because at the moment total_size reaches max_total_size the heap
+ *   must be at least that large.
+ *
+ *   Note that our implementation of mem_sbrk() does not allow the
+ *   student to decrement the brk pointer directly, but mem_reset_brk()
+ *   does, which is why we track the peak across every op.
  *   
- *   Changed to return max_total_size
+ *   Returns max_total_size; writes the observed peak heap size to
+ *   *peak_heapsize_out.
  */
-static int eval_mm_util(trace_t *trace, int tracenum, range_t **ranges)
+static int eval_mm_util(trace_t *trace, int tracenum, range_t **ranges,
+                        size_t *peak_heapsize_out)
 {   
     int i;
     int index;
     int size, newsize, oldsize;
     int max_total_size = 0;
     int total_size = 0;
+    size_t peak_heapsize = 0;
     char *p;
     char *newp, *oldp;
 
@@ -933,6 +954,10 @@ static int eval_mm_util(trace_t *trace, int tracenum, range_t **ranges)
     mem_reset_brk();
     if (mm_init() < 0)
         app_error("mm_init failed in eval_mm_util");
+
+    /* Seed the peak with the post-init heap size so that empty or
+     * all-free traces still produce a sane non-zero denominator. */
+    peak_heapsize = mem_heapsize();
 
     for (i = 0;  i < trace->num_ops;  i++) {
         switch (trace->ops[i].type) {
@@ -996,7 +1021,18 @@ static int eval_mm_util(trace_t *trace, int tracenum, range_t **ranges)
             app_error("Nonexistent request type in eval_mm_util");
 
         }
+
+        /* Sample peak heap size after every op. Doing this on free as
+         * well as alloc is what defeats mem_reset_brk()-based util
+         * inflation. mem_heapsize() is a single pointer subtraction,
+         * and eval_mm_util is not on the timed throughput path. */
+        size_t hs = mem_heapsize();
+        if (hs > peak_heapsize)
+            peak_heapsize = hs;
     }
+
+    if (peak_heapsize_out != NULL)
+        *peak_heapsize_out = peak_heapsize;
 
     return max_total_size;
 }
