@@ -291,7 +291,10 @@ static struct block *coalesce(struct block *bp)
 }
 
 /*
- * mm_realloc - Naive implementation of realloc
+ * Ideas and code were derived from Claude.
+ * mm_realloc - Now resizes an allocated block to at least a number of size of bytes.
+ * This will attempt to in-place expansion by absorbing a free next block if it is large enough.
+ * Then will fall back to malloc/memcpy/free if the expansion is not possible.
  */
 void *mm_realloc(void *ptr, size_t size)
 {
@@ -306,22 +309,43 @@ void *mm_realloc(void *ptr, size_t size)
         return mm_malloc(size);
     }
 
-    void *newptr = mm_malloc(size);
+    struct block *blk = ptr - offsetof(struct block, payload);
+    size_t oldsize = blk_size(blk);
 
-    /* If realloc() fails the original block is left untouched  */
-    if (!newptr) {
-        return 0;
+    /* Need to compute the required block size in words, this includes the header and footer */
+    size_t bsize = align(size + 2 * sizeof(struct boundary_tag));
+    size_t awords = max(MIN_BLOCK_SIZE_WORDS, round_up_to_alignment_words(bsize / WSIZE));
+
+    /* If the curren block is already large enough we can return as is */
+    if (awords <= oldsize)
+    {
+        return ptr;
     }
 
-    /* Copy the old data. */
-    struct block *oldblock = ptr - offsetof(struct block, payload);
-    size_t oldpayloadsize = blk_size(oldblock) * WSIZE - 2 * sizeof(struct boundary_tag);
-    if (size < oldpayloadsize) oldpayloadsize = size;
-    memcpy(newptr, ptr, oldpayloadsize);
+    /* If the next block is feee and the combined size is satisfied then we can expand in place */
+    struct block *next = next_blk(blk);
+    if (blk_free(next) && (oldsize + blk_size(next)) >= awords)
+    {
+        fl_remove(next); /* Remove next from the free list */
+        mark_block_used(blk, oldsize + blk_size(next)); /* Merge and mark as used */
+        return ptr; /* No data movement is needed */
+    }
 
-    /* Free the old block. */
+    /* Need to allocate a new block, copy the data, and free the old block */
+    void *newptr = mm_malloc(size);
+    if (!newptr)
+    {
+        return NULL;
+    }
+
+    /* Copy only the minimum amount of old and new payload sizes */
+    size_t copysize = oldsize * WSIZE - 2 * sizeof(struct boundary_tag);
+    if (size < copysize)
+    {
+        copysize = size;
+    }
+    memcpy(newptr, ptr, copysize);
     mm_free(ptr);
-
     return newptr;
 }
 
@@ -381,6 +405,7 @@ static void place(struct block *bp, size_t asize)
 /* 
  * find_fit - Find a fit for a block with asize words 
  * Ideas and code were derived from Claude.
+ * Find_fit now searches only a free list since we are now dealing with explicit free lists
  */
 static struct block *find_fit(size_t asize)
 {
