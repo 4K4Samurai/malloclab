@@ -423,7 +423,7 @@ static struct block *find_fit(size_t asize)
 
 team_t team = {
     /* Team name */
-    "Sample allocator using implicit lists",
+    "Keiji and Dimash",
     /* First member's full name */
     "Keiji Cabanacan",
     "kgcabanacan@vt.edu",
