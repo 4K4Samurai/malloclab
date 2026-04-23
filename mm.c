@@ -243,10 +243,21 @@ void mm_free(void *bp)
 static inline void fl_insert(struct block *blk)
 {
     struct free_block *fb = (struct free_block *)blk;
-    fb->next = free_list_head.next; /* New block points forward to old first */
-    fb->prev = &free_list_head; /* New block points back to the sentinel */
-    free_list_head.next->prev = fb; /* Old first points back to the new block */
-    free_list_head.next = fb; /* Sentinel points forward to the new block */ 
+    fb->next = free_list_head.next;
+    fb->prev = &free_list_head;
+    free_list_head.next->prev = fb;
+    free_list_head.next = fb;
+}
+
+/* Insert at tail so split remainders (large, end-of-heap) are found last by
+ * find_fit, leaving them available for future in-place realloc expansion. */
+static inline void fl_insert_tail(struct block *blk)
+{
+    struct free_block *fb = (struct free_block *)blk;
+    fb->prev = free_list_head.prev;
+    fb->next = &free_list_head;
+    free_list_head.prev->next = fb;
+    free_list_head.prev = fb;
 }
 
 /*
@@ -328,7 +339,7 @@ void *mm_realloc(void *ptr, size_t size)
             mark_block_used(blk, awords);
             struct block *remainder = next_blk(blk);
             mark_block_free(remainder, oldsize - awords);
-            coalesce(remainder);
+            coalesce(remainder);  /* coalesce handles fl_insert */
         }
         return ptr;
     }
@@ -345,7 +356,7 @@ void *mm_realloc(void *ptr, size_t size)
             mark_block_used(blk, awords);
             struct block *remainder = next_blk(blk);
             mark_block_free(remainder, merged - awords);
-            fl_insert(remainder);
+            fl_insert_tail(remainder);
         } else {
             mark_block_used(blk, merged);
         }
@@ -361,22 +372,30 @@ void *mm_realloc(void *ptr, size_t size)
         return ptr;
     }
 
-    /* Need to allocate a new block, copy the data, and free the old block */
-    void *newptr = mm_malloc(size);
-    if (!newptr)
-    {
-        return NULL;
+    /* Fallback: find a free block (or extend heap), place at tail so the
+     * remainder isn't stolen by the next small allocation, enabling the
+     * following realloc to expand in-place instead of falling back again. */
+    struct block *newblk = find_fit(awords);
+    if (newblk == NULL) {
+        newblk = extend_heap(max(awords, CHUNKSIZE));
+        if (newblk == NULL) return NULL;
+    }
+    size_t newcsize = blk_size(newblk);
+    fl_remove(newblk);
+    if ((newcsize - awords) >= MIN_BLOCK_SIZE_WORDS) {
+        mark_block_used(newblk, awords);
+        struct block *remainder = next_blk(newblk);
+        mark_block_free(remainder, newcsize - awords);
+        fl_insert_tail(remainder);
+    } else {
+        mark_block_used(newblk, newcsize);
     }
 
-    /* Copy only the minimum amount of old and new payload sizes */
     size_t copysize = oldsize * WSIZE - 2 * sizeof(struct boundary_tag);
-    if (size < copysize)
-    {
-        copysize = size;
-    }
-    memcpy(newptr, ptr, copysize);
+    if (size < copysize) copysize = size;
+    memcpy(newblk->payload, ptr, copysize);
     mm_free(ptr);
-    return newptr;
+    return newblk->payload;
 }
 
 /*
@@ -453,7 +472,7 @@ static void place(struct block *bp, size_t asize)
     size_t csize = blk_size(bp);
     fl_remove(bp);
 
-    if ((csize - asize) >= MIN_BLOCK_SIZE_WORDS) { 
+    if ((csize - asize) >= MIN_BLOCK_SIZE_WORDS) {
         mark_block_used(bp, asize);
         struct block *remainder = next_blk(bp);
         mark_block_free(remainder, csize - asize);
