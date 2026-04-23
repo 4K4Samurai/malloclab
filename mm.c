@@ -333,8 +333,9 @@ void *mm_realloc(void *ptr, size_t size)
         return ptr;
     }
 
-    /* If the next block is free and the combined size is sufficient, expand in place */
     struct block *next = next_blk(blk);
+
+    /* If the next block is free and the combined size is sufficient, expand in place */
     if (blk_free(next) && (oldsize + blk_size(next)) >= awords)
     {
         size_t merged = oldsize + blk_size(next);
@@ -348,6 +349,15 @@ void *mm_realloc(void *ptr, size_t size)
         } else {
             mark_block_used(blk, merged);
         }
+        return ptr;
+    }
+
+    /* If at the end of the heap, extend in place — avoids malloc+copy+free entirely */
+    if (blk_size(next) == 0) {
+        size_t need = awords - oldsize;
+        if (mem_sbrk(need * WSIZE) == NULL) return NULL;
+        mark_block_used(blk, awords);
+        next_blk(blk)->header = FENCE;
         return ptr;
     }
 
