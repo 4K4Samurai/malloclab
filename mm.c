@@ -57,14 +57,14 @@ struct block {
 /* Ideas were derived from claude */
 struct free_block {
     struct boundary_tag header; /* offset at 0, at address 12 mod 16 */
-    char padding[4]; /* offset 4, padding to align to pointers */
+    char padding[4]; /* offset 4: header is 4 bytes, pointers are 8-byte aligned on x86-64 */
     struct free_block *next; /* offset 8 */
     struct free_block *prev; /* offset 16 */
 };
 
 /* Basic constants and macros */
 #define WSIZE       sizeof(struct boundary_tag)  /* Word and header/footer size (bytes) */
-#define MIN_BLOCK_SIZE_WORDS 8  /* Minimum block size in words */
+#define MIN_BLOCK_SIZE_WORDS 8  /* header(1) + padding(1) + next(2) + prev(2) + footer(1) = 7 words, rounded to 8 */
 #define CHUNKSIZE  (1<<10)  /* Extend heap by this amount (words) */
 
 static inline size_t max(size_t x, size_t y) {
@@ -80,6 +80,8 @@ static bool is_aligned(size_t size) {
   return size % ALIGNMENT == 0;
 }
 
+/* Round up to a multiple of 8 words (32 bytes) to satisfy 16-byte payload alignment.
+ * Blocks start at 12 mod 16, so payload lands at 0 mod 16 only when block size is 8-word aligned. */
 static size_t round_up_to_alignment_words(size_t words)
 {
     return (words + 7) & ~((size_t)7);
@@ -98,23 +100,23 @@ static struct block *coalesce(struct block *bp);
 
 /* Given a block, obtain previous's block footer.
    Works for left-most block also. */
-static struct boundary_tag * prev_blk_footer(struct block *blk) {
+static inline struct boundary_tag * prev_blk_footer(struct block *blk) {
     return &blk->header - 1;
 }
 
 /* Return if block is free */
-static bool blk_free(struct block *blk) { 
-    return !blk->header.inuse; 
+static inline bool blk_free(struct block *blk) {
+    return !blk->header.inuse;
 }
 
 /* Return size of block is free */
-static size_t blk_size(struct block *blk) { 
-    return blk->header.size; 
+static inline size_t blk_size(struct block *blk) {
+    return blk->header.size;
 }
 
 /* Given a block, obtain pointer to previous block.
    Not meaningful for left-most block. */
-static struct block *prev_blk(struct block *blk) {
+static inline struct block *prev_blk(struct block *blk) {
     struct boundary_tag *prevfooter = prev_blk_footer(blk);
     assert(prevfooter->size != 0);
     return (struct block *)((void *)blk - WSIZE * prevfooter->size);
@@ -122,31 +124,31 @@ static struct block *prev_blk(struct block *blk) {
 
 /* Given a block, obtain pointer to next block.
    Not meaningful for right-most block. */
-static struct block *next_blk(struct block *blk) {
+static inline struct block *next_blk(struct block *blk) {
     assert(blk_size(blk) != 0);
     return (struct block *)((void *)blk + WSIZE * blk->header.size);
 }
 
 /* Given a block, obtain its footer boundary tag */
-static struct boundary_tag * get_footer(struct block *blk) {
+static inline struct boundary_tag * get_footer(struct block *blk) {
     return ((void *)blk + WSIZE * blk->header.size)
                    - sizeof(struct boundary_tag);
 }
 
 /* Set a block's size and inuse bit in header and footer */
-static void set_header_and_footer(struct block *blk, int size, int inuse) {
+static inline void set_header_and_footer(struct block *blk, int size, int inuse) {
     blk->header.inuse = inuse;
     blk->header.size = size;
     * get_footer(blk) = blk->header;    /* Copy header to footer */
 }
 
 /* Mark a block as used and set its size. */
-static void mark_block_used(struct block *blk, int size) {
+static inline void mark_block_used(struct block *blk, int size) {
     set_header_and_footer(blk, size, 1);
 }
 
 /* Mark a block as free and set its size. */
-static void mark_block_free(struct block *blk, int size) {
+static inline void mark_block_free(struct block *blk, int size) {
     set_header_and_footer(blk, size, 0);
 }
 
@@ -172,6 +174,7 @@ int mm_init(void)
      * and not prev_blk() because prev_blk() cannot be called on the
      * left-most block.
      */
+    /* initial[0..1] are unused alignment padding before the prologue fence. */
     initial[2] = FENCE;                     /* Prologue footer */
     heap_listp = (struct block *)&initial[3];
     initial[3] = FENCE;                     /* Epilogue header */
@@ -237,7 +240,7 @@ void mm_free(void *bp)
  * This will insert a block at the front of the explicit free list.
  * Then casts the block to a free_block to access the next/prev pointers.
  */
-static void fl_insert(struct block *blk)
+static inline void fl_insert(struct block *blk)
 {
     struct free_block *fb = (struct free_block *)blk;
     fb->next = free_list_head.next; /* New block points forward to old first */
@@ -253,7 +256,7 @@ static void fl_insert(struct block *blk)
  * Then splices the block out by linking it to a predecessor directly to the
  * successor. 
  */
-static void fl_remove(struct block *blk)
+static inline void fl_remove(struct block *blk)
 {
     struct free_block *fb = (struct free_block *)blk;
     fb->prev->next = fb->next; /* Predecessor skips over the free block */
@@ -264,24 +267,26 @@ static void fl_remove(struct block *blk)
  * coalesce - Boundary tag coalescing. Return ptr to coalesced block
  * Ideas and code were derived from Claude 
  */
-static struct block *coalesce(struct block *bp) 
+static struct block *coalesce(struct block *bp)
 {
+    struct block *next = next_blk(bp);
     bool prev_alloc = prev_blk_footer(bp)->inuse;   /* is previous block allocated? */
-    bool next_alloc = ! blk_free(next_blk(bp));     /* is next block allocated? */
+    bool next_alloc = !blk_free(next);              /* is next block allocated? */
     size_t size = blk_size(bp);
 
+    /* Merge next before prev: next_blk(bp) is only valid while bp hasn't moved yet. */
     if (!next_alloc)
     {
-        fl_remove(next_blk(bp));
-        size = size + blk_size(next_blk(bp));
+        fl_remove(next);
+        size += blk_size(next);
     }
 
     if (!prev_alloc)
     {
-        size_t prev_size = blk_size(prev_blk(bp));
-        fl_remove(prev_blk(bp));
-        bp = prev_blk(bp);
-        size = size + prev_size;
+        struct block *prev = prev_blk(bp);
+        fl_remove(prev);
+        size += blk_size(prev);
+        bp = prev;
     }
 
     mark_block_free(bp, size);
@@ -322,13 +327,22 @@ void *mm_realloc(void *ptr, size_t size)
         return ptr;
     }
 
-    /* If the next block is feee and the combined size is satisfied then we can expand in place */
+    /* If the next block is free and the combined size is sufficient, expand in place */
     struct block *next = next_blk(blk);
     if (blk_free(next) && (oldsize + blk_size(next)) >= awords)
     {
-        fl_remove(next); /* Remove next from the free list */
-        mark_block_used(blk, oldsize + blk_size(next)); /* Merge and mark as used */
-        return ptr; /* No data movement is needed */
+        size_t merged = oldsize + blk_size(next);
+        fl_remove(next);
+        if ((merged - awords) >= MIN_BLOCK_SIZE_WORDS) {
+            /* Split: return excess to free list rather than holding it */
+            mark_block_used(blk, awords);
+            struct block *remainder = next_blk(blk);
+            mark_block_free(remainder, merged - awords);
+            fl_insert(remainder);
+        } else {
+            mark_block_used(blk, merged);
+        }
+        return ptr;
     }
 
     /* Need to allocate a new block, copy the data, and free the old block */
