@@ -71,7 +71,7 @@ static inline size_t max(size_t x, size_t y) {
     return x > y ? x : y;
 }
 
-static size_t align(size_t size) {
+static inline size_t align(size_t size) {
   return (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 }
 
@@ -82,7 +82,7 @@ static bool is_aligned(size_t size) {
 
 /* Round up to a multiple of 8 words (32 bytes) to satisfy 16-byte payload alignment.
  * Blocks start at 12 mod 16, so payload lands at 0 mod 16 only when block size is 8-word aligned. */
-static size_t round_up_to_alignment_words(size_t words)
+static inline size_t round_up_to_alignment_words(size_t words)
 {
     return (words + 7) & ~((size_t)7);
 }
@@ -109,7 +109,7 @@ static inline bool blk_free(struct block *blk) {
     return !blk->header.inuse;
 }
 
-/* Return size of block is free */
+/* Return size of block in words */
 static inline size_t blk_size(struct block *blk) {
     return blk->header.size;
 }
@@ -321,9 +321,15 @@ void *mm_realloc(void *ptr, size_t size)
     size_t bsize = align(size + 2 * sizeof(struct boundary_tag));
     size_t awords = max(MIN_BLOCK_SIZE_WORDS, round_up_to_alignment_words(bsize / WSIZE));
 
-    /* If the curren block is already large enough we can return as is */
+    /* If the current block is already large enough, shrink and split if excess is usable */
     if (awords <= oldsize)
     {
+        if ((oldsize - awords) >= MIN_BLOCK_SIZE_WORDS) {
+            mark_block_used(blk, awords);
+            struct block *remainder = next_blk(blk);
+            mark_block_free(remainder, oldsize - awords);
+            coalesce(remainder);
+        }
         return ptr;
     }
 
@@ -363,11 +369,44 @@ void *mm_realloc(void *ptr, size_t size)
     return newptr;
 }
 
-/* 
- * checkheap - We don't check anything right now. 
+/*
+ * checkheap - Verify heap invariants.
  */
 void mm_checkheap(int verbose)
-{ 
+{
+    /* Walk every block and check header/footer consistency and alignment */
+    for (struct block *blk = heap_listp; blk_size(blk) > 0; blk = next_blk(blk)) {
+        struct boundary_tag *footer = get_footer(blk);
+        if (blk->header.inuse != footer->inuse || blk->header.size != footer->size) {
+            fprintf(stderr, "checkheap: header/footer mismatch at %p\n", (void *)blk);
+            abort();
+        }
+        if (!is_aligned((size_t)blk->payload)) {
+            fprintf(stderr, "checkheap: payload misaligned at %p\n", (void *)blk);
+            abort();
+        }
+        /* No two consecutive free blocks should exist (coalescing invariant) */
+        if (blk_free(blk) && blk_size(next_blk(blk)) > 0 && blk_free(next_blk(blk))) {
+            fprintf(stderr, "checkheap: consecutive free blocks at %p\n", (void *)blk);
+            abort();
+        }
+    }
+
+    /* Every block in the free list must actually be free */
+    for (struct free_block *fp = free_list_head.next; fp != &free_list_head; fp = fp->next) {
+        if (!blk_free((struct block *)fp)) {
+            fprintf(stderr, "checkheap: allocated block on free list at %p\n", (void *)fp);
+            abort();
+        }
+        /* Check prev/next pointers are consistent */
+        if (fp->next->prev != fp || fp->prev->next != fp) {
+            fprintf(stderr, "checkheap: free list pointer inconsistency at %p\n", (void *)fp);
+            abort();
+        }
+    }
+
+    if (verbose)
+        fprintf(stderr, "checkheap: OK\n");
 }
 
 /* 
