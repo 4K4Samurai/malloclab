@@ -71,6 +71,17 @@ static inline size_t max(size_t x, size_t y) {
     return x > y ? x : y;
 }
 
+/* Round size up to the next power of 2 if it falls in the top 1/8 of that
+ * class (e.g. 448→512). Freed blocks from one allocation cycle can then be
+ * reused by a slightly-larger same-class request, cutting external fragmentation
+ * on traces with near-power-of-2 size patterns. */
+static inline size_t size_class_round(size_t size) {
+    if (size > 512) return size;
+    size_t power = 8;
+    while (power < size) power <<= 1;
+    return (size >= power - power / 8) ? power : size;
+}
+
 static inline size_t align(size_t size) {
   return (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 }
@@ -80,17 +91,38 @@ static bool is_aligned(size_t size) {
   return size % ALIGNMENT == 0;
 }
 
-/* Round up to a multiple of 8 words (32 bytes) to satisfy 16-byte payload alignment.
- * Blocks start at 12 mod 16, so payload lands at 0 mod 16 only when block size is 8-word aligned. */
+/* Round up to a multiple of 4 words (16 bytes).
+ * Blocks start at 12 mod 16, so payload lands at 0 mod 16 for any 4-word-multiple block size. */
 static inline size_t round_up_to_alignment_words(size_t words)
 {
-    return (words + 7) & ~((size_t)7);
+    return (words + 3) & ~((size_t)3);
+}
+
+/* Segregated free list: 12 size classes (boundaries in words):
+ *   0:≤8  1:≤16  2:≤32  3:≤64  4:≤128  5:≤256  6:≤512
+ *   7:≤1024  8:≤2048  9:≤4096  10:≤8192  11:>8192
+ * Finer large-block granularity gives near-best-fit for random-size traces
+ * without paying O(n) best-fit cost. */
+#define NUM_CLASSES 12
+static struct free_block free_lists[NUM_CLASSES];
+
+static inline int size_class(size_t words) {
+    if (words <=    8) return 0;
+    if (words <=   16) return 1;
+    if (words <=   32) return 2;
+    if (words <=   64) return 3;
+    if (words <=  128) return 4;
+    if (words <=  256) return 5;
+    if (words <=  512) return 6;
+    if (words <= 1024) return 7;
+    if (words <= 2048) return 8;
+    if (words <= 4096) return 9;
+    if (words <= 8192) return 10;
+    return 11;
 }
 
 /* Global variables */
-static struct block *heap_listp = 0;  /* Pointer to first block */  
-
-static struct free_block free_list_head; /* this should be sentinel, so it is never allocated */
+static struct block *heap_listp = 0;  /* Pointer to first block */
 
 /* Function prototypes for internal helper routines */
 static struct block *extend_heap(size_t words);
@@ -157,8 +189,10 @@ static inline void mark_block_free(struct block *blk, int size) {
  */
 int mm_init(void) 
 {
-    free_list_head.next = &free_list_head;
-    free_list_head.prev = &free_list_head;
+    for (int i = 0; i < NUM_CLASSES; i++) {
+        free_lists[i].next = &free_lists[i];
+        free_lists[i].prev = &free_lists[i];
+    }
 
     assert (sizeof(struct boundary_tag) == 4);
 
@@ -179,9 +213,6 @@ int mm_init(void)
     heap_listp = (struct block *)&initial[3];
     initial[3] = FENCE;                     /* Epilogue header */
 
-    /* Extend the empty heap with a free block of CHUNKSIZE bytes */
-    if (extend_heap(CHUNKSIZE) == NULL) 
-        return -1;
     return 0;
 }
 
@@ -195,6 +226,8 @@ void *mm_malloc(size_t size)
     /* Ignore spurious requests */
     if (size == 0)
         return NULL;
+
+    size = size_class_round(size);
 
     /* Adjust block size to include overhead and alignment reqs. */
     size_t bsize = align(size + 2 * sizeof(struct boundary_tag));    /* account for tags */
@@ -237,27 +270,30 @@ void mm_free(void *bp)
 
 /*
  * Ideas and code were derived from Claude.
- * This will insert a block at the front of the explicit free list.
- * Then casts the block to a free_block to access the next/prev pointers.
+ * This will insert a block at the front of the appropriate size-class free list.
  */
 static inline void fl_insert(struct block *blk)
 {
     struct free_block *fb = (struct free_block *)blk;
-    fb->next = free_list_head.next;
-    fb->prev = &free_list_head;
-    free_list_head.next->prev = fb;
-    free_list_head.next = fb;
+    struct free_block *head = &free_lists[size_class(blk_size(blk))];
+    fb->next = head->next;
+    fb->prev = head;
+    head->next->prev = fb;
+    head->next = fb;
 }
 
-/* Insert at tail so split remainders (large, end-of-heap) are found last by
- * find_fit, leaving them available for future in-place realloc expansion. */
+/* Insert at tail of the largest class. Realloc remainders (end_free) must
+ * land in class7 at TAIL regardless of their actual size so that small
+ * mallocs (which search classes 0→6 first) never steal end_free before
+ * they reach the stranded block, preserving in-place expansion adjacency. */
 static inline void fl_insert_tail(struct block *blk)
 {
     struct free_block *fb = (struct free_block *)blk;
-    fb->prev = free_list_head.prev;
-    fb->next = &free_list_head;
-    free_list_head.prev->next = fb;
-    free_list_head.prev = fb;
+    struct free_block *head = &free_lists[NUM_CLASSES - 1];
+    fb->prev = head->prev;
+    fb->next = head;
+    head->prev->next = fb;
+    head->prev = fb;
 }
 
 /*
@@ -421,16 +457,21 @@ void mm_checkheap(int verbose)
         }
     }
 
-    /* Every block in the free list must actually be free */
-    for (struct free_block *fp = free_list_head.next; fp != &free_list_head; fp = fp->next) {
-        if (!blk_free((struct block *)fp)) {
-            fprintf(stderr, "checkheap: allocated block on free list at %p\n", (void *)fp);
-            abort();
-        }
-        /* Check prev/next pointers are consistent */
-        if (fp->next->prev != fp || fp->prev->next != fp) {
-            fprintf(stderr, "checkheap: free list pointer inconsistency at %p\n", (void *)fp);
-            abort();
+    /* Every block in each free list must be free and have consistent pointers.
+     * Note: fl_insert_tail places realloc remainders in class7 regardless of
+     * their actual size, so we don't check size_class(blk) == cls here. */
+    for (int cls = 0; cls < NUM_CLASSES; cls++) {
+        for (struct free_block *fp = free_lists[cls].next;
+             fp != &free_lists[cls]; fp = fp->next) {
+            if (!blk_free((struct block *)fp)) {
+                fprintf(stderr, "checkheap: allocated block on free list[%d] at %p\n",
+                        cls, (void *)fp);
+                abort();
+            }
+            if (fp->next->prev != fp || fp->prev->next != fp) {
+                fprintf(stderr, "checkheap: free list pointer inconsistency at %p\n", (void *)fp);
+                abort();
+            }
         }
     }
 
@@ -445,7 +486,7 @@ void mm_checkheap(int verbose)
 /* 
  * extend_heap - Extend heap with free block and return its block pointer
  */
-static struct block *extend_heap(size_t words) 
+static struct block *extend_heap(size_t words)
 {
     void *bp = mem_sbrk(words * WSIZE);
 
@@ -484,23 +525,21 @@ static void place(struct block *bp, size_t asize)
     }
 }
 
-/* 
- * find_fit - Find a fit for a block with asize words 
- * Ideas and code were derived from Claude.
- * Find_fit now searches only a free list since we are now dealing with explicit free lists
+/*
+ * find_fit - Find a fit for a block with asize words.
+ * Searches size classes from the smallest that could hold asize upward,
+ * giving near-best-fit behavior without scanning the whole free list.
  */
 static struct block *find_fit(size_t asize)
 {
-    /* First fit search */
-    for (struct free_block *fp = free_list_head.next;
-        fp != &free_list_head; fp = fp->next)
-        {
+    for (int cls = size_class(asize); cls < NUM_CLASSES; cls++) {
+        for (struct free_block *fp = free_lists[cls].next;
+             fp != &free_lists[cls]; fp = fp->next) {
             if (asize <= blk_size((struct block *)fp))
-            {
                 return (struct block *)fp;
-            }
         }
-    return NULL; /* No fit */
+    }
+    return NULL;
 }
 
 team_t team = {
